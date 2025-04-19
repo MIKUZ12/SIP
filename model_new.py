@@ -211,7 +211,7 @@ class Net(nn.Module):
         # 这里还需要修改，此处是默认取了第一个视图作为保留视图(索引0)
         mapped_data = self.mlp_2view(x_list[0])
         # 用 mapped_data 替代后续的消失视图
-        x_list[1] = mapped_data
+        # x_list[1] = mapped_data
         # label_embedding = gaussian_reparameterization_std(self.label_embedding_u,self.label_embedding_std)
         # label_embedding = self.GAT_encoder(label_embedding, self.adj)
         assert torch.sum(torch.isnan(self.label_embedding_u)).item() == 0
@@ -226,72 +226,40 @@ class Net(nn.Module):
         if torch.sum(torch.isnan(label_embedding)).item() > 0:
             assert torch.sum(torch.isnan(label_embedding)).item() == 0
         # x_list是输入的data，mask是掩码
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, pos_beat_I = self.VAE(x_list,mask)  #Z[i]=[128, 260, 512] b c d_e
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p = self.VAE(x_list,mask)  #Z[i]=[128, 260, 512] b c d_e
         if torch.sum(torch.isnan(z_sample)).item() > 0:
             pass
-        
-        
-        
-        # p = p.mul(torch.softmax(self.W,dim=0).unsqueeze(dim=0))
-        # print(confi[:10]) 
-        
-        # mask_confi = (1-mask).mul(confi.unsqueeze(-1))+mask # b m
-        # mask_confi = (1-mask).mul(confi.t())+mask # b m
-        # p = p.masked_fill(mask.unsqueeze(dim=-1)==0,-1e9)
-        # p = self.maxP(p).squeeze(dim=1)
-        # p = torch.max(p,dim=1)
-        # print(mask_confi.shape,(mask_confi==1).sum())
-        # if self.training:
-        # print(mask_confi[:10,:],mask[:10,:],confi[0,:10])
-        # mask_confi = mask_confi/(mask_confi.sum(dim=1,keepdim=True)+1e-9)   # b*m
-        
-        # p = p.mul(mask_confi.unsqueeze(dim=-1))
-        # p = p.sum(dim = 1)
-        # p = torch.sigmoid(qc_z)
-        ###LxZ
-        # xc_fusion_mu, xc_fusion_var = self.poe_two(fusion_z_mu, fusion_z_sca,label_embedding, label_embedding_var)
-        # z_sample_xc = gaussian_reparameterization_var(xc_fusion_mu,xc_fusion_var)
-        # p = self.cls_conv(z_sample_xc).squeeze(-1)
-        ###LxZ2
-        # qc_z = ((z_sample).unsqueeze(1).mul((label_embedding).unsqueeze(0)))
-        # p = self.cls_conv(qc_z).squeeze(-1)
-
-
-        ###LxZ3
-        # label_embedding_sample = gaussian_reparameterization_var(label_embedding,label_embedding_var)
-        # qc_z = ((z_sample).unsqueeze(1).mul((label_embedding_sample).unsqueeze(0)))
-        # p = self.cls_conv(qc_z).squeeze(-1)
-        
-        ###LxZ4
-        # label_embedding_sample = gaussian_reparameterization_var(label_embedding,label_embedding_var)
-        # qc_z = ((z_sample).unsqueeze(1).mul((torch.sigmoid(label_embedding_sample)).unsqueeze(0)))
-        # p = self.cls_conv(qc_z).squeeze(-1)
-        
-        ###LxZ5
         # z_sample是从编码器得到的混合分布中采样的潜在变量，label_embedding_sample是标签嵌入之后采样的潜在标签，然后连接起来
         qc_z = torch.cat((z_sample.unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample.shape[0],1,1)),dim=-1)
         # 连接起来的潜在特征经过一个fully connected layer
-        p = self.cls_conv(qc_z).squeeze(-1)
-        
-        ###Ori
-        # p = self.cls(z_sample)
-        
-        # p_list = []
-        # for i in range(len(x_list)):
-        #     z_i = gaussian_reparameterization_var(uniview_mu_list[i],uniview_sca_list[i])
-        #     z_c_i = torch.cat((z_i.unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample.shape[0],1,1)),dim=-1)
-        #     # p_i = self.cls_conv(z_c_i).squeeze(-1)
-        #     p_i = self.cls(z_c_i).squeeze(-1)
-        #     p_list.append(torch.sigmoid(p_i))
-        #     if torch.sum(torch.isnan(p_list[i])).item() > 0:
-        #         pass
-
+        p_s = self.cls_conv(qc_z).squeeze(-1)
+        qc_p0 = torch.cat((z_sample_list_p[0].unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[0].shape[0],1,1)),dim=-1)
+        qc_p1 = torch.cat((z_sample_list_p[1].unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[1].shape[0],1,1)),dim=-1)     
+        p_p0 = self.cls_conv(qc_p0).squeeze(-1)
+        p_p1 = self.cls_conv(qc_p1).squeeze(-1)
         # 再经过一次sigmoid，以上三步对应的是论文（公式11）
-        p = torch.sigmoid(p)
+        p_s = torch.sigmoid(p_s)
+        p_p0 = torch.sigmoid(p_p0)
+        p_p1 = torch.sigmoid(p_p1)
+
+        # 计算每个分类器的交叉熵损失
+        loss_s = - (p_s * torch.log(p_s) + (1 - p_s) * torch.log(1 - p_s))
+        loss_p0 = - (p_p0 * torch.log(p_p0) + (1 - p_p0) * torch.log(1 - p_p0))
+        loss_p1 = - (p_p1 * torch.log(p_p1) + (1 - p_p1) * torch.log(1 - p_p1))
+
+        # 计算损失的倒数作为权重
+        weight_s = 1 / loss_s
+        weight_p0 = 1 / loss_p0
+        weight_p1 = 1 / loss_p1
+
+        # 合并权重并归一化
+        weights = torch.stack([weight_s, weight_p0, weight_p1])
+        weights_normalized = weights / weights.sum()
+
+        # 对三个分类器的预测结果进行加权融合
+        p_fused = weights_normalized[0] * p_s + weights_normalized[1] * p_p0 + weights_normalized[2] * p_p1
         
-        # x_from_label = p.matmul(label_embedding_sample)/(p.sum(dim=1,keepdim=True)+1e-8) #[n, d]
-        # p_xr_list = self.VAE.generation_x_p(x_from_label)
-        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p, xr_p_list, pos_beat_I, mapped_data
+        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, mapped_data
 
 def get_model(d_list,num_classes,z_dim,adj,rand_seed=0):
     model = Net(d_list,num_classes=num_classes,z_dim=z_dim,adj=adj,rand_seed=rand_seed)

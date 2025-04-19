@@ -55,7 +55,7 @@ def train_step1(loader, model, loss_model, opt, sche, epoch,dep_graph,last_preds
         inc_V_ind = inc_V_ind.float().to('cuda:0')
         inc_L_ind = inc_L_ind.float().to('cuda:0')
         # data是多视图的信息
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, pred, xr_p_list, pos_beta_I, mapped_data = model(data_selected, mask=inc_V_ind)
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, pred, xr_p_list, cos_loss, mapped_data = model(data_selected, mask=inc_V_ind)
         All_preds = torch.cat([All_preds,pred],dim=0) # 融合之后的预测输出
 
         if epoch<args.pre_epochs:
@@ -69,7 +69,7 @@ def train_step1(loader, model, loss_model, opt, sche, epoch,dep_graph,last_preds
             loss_CL = loss_model.weighted_BCE_loss(pred,label,inc_L_ind) # 分类损失
             z_c_loss = loss_model.z_c_loss_new(z_sample, label, label_emb_sample,inc_L_ind)
             cohr_loss = loss_model.corherent_loss(uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca,mask=inc_V_ind)
-            mapping_loss = F.mse_loss(mapped_data, original_data[1])
+            mapping_loss = F.mse_loss(mapped_data, data_selected[1])
             loss_mse = 0
             loss_mse_p = 0
             loss_pos_beta_I = 0
@@ -80,10 +80,10 @@ def train_step1(loader, model, loss_model, opt, sche, epoch,dep_graph,last_preds
             for v in range(len(data_selected)):
                 ## xr_list是每个重构的视图，这个损失是用来约束VAE的，使得潜在空间的特征能够很好的表征原数据
                 loss_mse_p += loss_model.weighted_wmse_loss(data_selected[v],xr_p_list[v],inc_V_ind[:,v],reduction='mean')
-            loss_pos_beta_I = pos_beta_I
+            cos_loss = cos_loss
             assert torch.sum(torch.isnan(loss_mse)).item() == 0
-            # loss = loss_CL + loss_mse *args.alpha + z_c_loss*args.beta + cohr_loss *args.sigma + loss_mse_p + loss_pos_beta_I + mapping_loss
-            loss = loss_CL
+            # loss = loss_CL + loss_mse *args.alpha + z_c_loss*args.beta + cohr_loss *args.sigma + loss_mse_p + 0.01*loss_pos_beta_I + mapping_loss
+            loss = loss_CL + loss_mse + mapping_loss + cohr_loss + cos_loss*0.1
         opt.zero_grad()
         loss.backward()
         if isinstance(sche,CosineAnnealingWarmRestarts):
@@ -102,6 +102,81 @@ def train_step1(loader, model, loss_model, opt, sche, epoch,dep_graph,last_preds
                         epoch,   batch_time=batch_time,
                         data_time=data_time, losses=losses))
     return losses,model,All_preds
+
+def train_step2(loader, model, model_last, loss_model, opt, sche, epoch,dep_graph,last_preds,logger, selected_view):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    mce= nn.MultiLabelSoftMarginLoss()
+    model = model.to('cuda:0')
+    model_last = model_last.to('cuda:0')
+    model.train()
+    model_last.eval()
+    end = time.time()
+    All_preds = torch.tensor([]).cuda()
+    for i, (data, label, inc_V_ind, inc_L_ind) in enumerate(loader):
+        data_time.update(time.time() - end)
+        data=[v_data.to('cuda:0') for v_data in data]
+        complete_view = model_last.mlp_2view(data[selected_view[1]])
+        original_data = copy.deepcopy(data) 
+        original_data = [v_data.to('cuda:0') for v_data in original_data]
+        data_selected = [data[i] for i in selected_view]
+        data_selected.append(complete_view)
+        # 在两个视图的数据之间构建一个mlp用于映射
+        label = label.to('cuda:0')
+        inc_V_ind = inc_V_ind.float().to('cuda:0')
+        inc_L_ind = inc_L_ind.float().to('cuda:0')
+        # data是多视图的信息
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, pred, xr_p_list, pos_beta_I, mapped_data = model(data_selected, mask=inc_V_ind)
+        All_preds = torch.cat([All_preds,pred],dim=0) # 融合之后的预测输出
+
+        if epoch<args.pre_epochs:
+            loss_mse_viewspec = 0
+            loss_CL_views = 0
+            loss_list=[]
+            loss = loss_CL_views
+            assert torch.sum(torch.isnan(loss)).item() == 0
+            assert torch.sum(torch.isinf(loss)).item() == 0
+        else:
+            loss_CL = loss_model.weighted_BCE_loss(pred,label,inc_L_ind) # 分类损失
+            z_c_loss = loss_model.z_c_loss_new(z_sample, label, label_emb_sample,inc_L_ind)
+            cohr_loss = loss_model.corherent_loss(uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca,mask=inc_V_ind)
+            mapping_loss = F.mse_loss(mapped_data, original_data[1])
+            loss_mse = 0
+            loss_mse_p = 0
+            loss_pos_beta_I = 0
+            for v in range(len(data_selected)-1):
+                ## xr_list是每个重构的视图，这个损失是用来约束VAE的，使得潜在空间的特征能够很好的表征原数据
+                ## 对应（公式7）的第一项，最大化重构概率，对应最大化互信息的下界
+                loss_mse += loss_model.weighted_wmse_loss(data_selected[v],xr_list[v],inc_V_ind[:,v],reduction='mean')
+            for v in range(len(data_selected)-1):
+                ## xr_list是每个重构的视图，这个损失是用来约束VAE的，使得潜在空间的特征能够很好的表征原数据
+                loss_mse_p += loss_model.weighted_wmse_loss(data_selected[v],xr_p_list[v],inc_V_ind[:,v],reduction='mean')
+            loss_pos_beta_I = pos_beta_I
+            assert torch.sum(torch.isnan(loss_mse)).item() == 0
+            # loss = loss_CL + loss_mse *args.alpha + z_c_loss*args.beta + cohr_loss *args.sigma + loss_mse_p + 0.01*loss_pos_beta_I + mapping_loss
+            loss = loss_CL + loss_mse + mapping_loss + cohr_loss
+            # 打印出loss_pos_beta_I的大小：
+        opt.zero_grad()
+        loss.backward()
+        if isinstance(sche,CosineAnnealingWarmRestarts):
+            sche.step(epoch + i / len(loader))
+        opt.step()
+        # print(model.classifier.parameters().grad)
+        losses.update(loss.item())
+        batch_time.update(time.time()- end)
+        end = time.time()
+    if isinstance(sche,StepLR):
+        sche.step()
+    logger.info('Epoch:[{0}]\t'
+                  'Time {batch_time.avg:.3f}\t'
+                  'Data {data_time.avg:.3f}\t'
+                  'Loss {losses.avg:.3f}'.format(
+                        epoch,   batch_time=batch_time,
+                        data_time=data_time, losses=losses))
+    return losses,model,All_preds
+
+
 
 def test(loader, model, loss_model, epoch, logger, selected_view):
     batch_time = AverageMeter()
@@ -214,11 +289,12 @@ def main(args,file_path):
                     best_model_dict = {'model':model.state_dict(),'epoch':0}
 
                     # 设置第一阶段和第二阶段的分界线
-                    bound = 30
+                    bound = 10
 
                     for epoch in range(args.epochs):
                         if (epoch <= bound):
-                            selected_view = [0, 1]
+                            selected_view = [1, 0]
+                            print("selected_view: ",selected_view)
                             d_list_selected = [train_dataset.d_list[i] for i in selected_view]
                             model_1 = get_model(d_list_selected,num_classes=classes_num,z_dim=args.z_dim,adj=dep_graph,rand_seed=0)
                             optimizer_1 = Adam(model_1.parameters(), lr=args.lr)
@@ -226,7 +302,7 @@ def main(args,file_path):
                                 All_preds = None
                             train_losses,model,All_preds = train_step1(train_dataloder,model_1,loss_model,optimizer_1,scheduler,epoch,dep_graph,All_preds,logger, selected_view)
   
-                            if epoch>=args.pre_epochs:
+                            if epoch >= args.pre_epochs:
 
                                 val_results = test(val_dataloder,model,loss_model,epoch,logger, selected_view)
                                 if val_results[0]*0.25+val_results[4]*0.25+val_results[5]*0.25>=static_res:
@@ -236,10 +312,33 @@ def main(args,file_path):
                                     best_epoch=epoch
                                 train_losses_last = train_losses
                                 total_losses.update(train_losses.sum)
+                        else:
+                            print("进入第二阶段")
+                            selected_view = [2, 1]
+                            print("selected_view: ",selected_view)
+                            d_list_selected = [train_dataset.d_list[i] for i in selected_view]
+                            model_2 = get_model(d_list_selected,num_classes=classes_num,z_dim=args.z_dim,adj=dep_graph,rand_seed=0)
+                            model_2 = model_2.to('cuda:0')
+                            optimizer_2 = Adam(model_2.parameters(), lr=args.lr)
+                            if epoch==0:
+                                All_preds = None
+                            train_losses,model,All_preds = train_step2(train_dataloder,model_2, model_1, loss_model,optimizer_2,scheduler,epoch,dep_graph,All_preds,logger, selected_view)
+                            
+                            if epoch >= args.pre_epochs:
+
+                                val_results = test(val_dataloder,model,loss_model,epoch,logger, selected_view)
+                                if val_results[0]*0.25+val_results[4]*0.25+val_results[5]*0.25>=static_res:
+                                    static_res = val_results[0]*0.25+val_results[4]*0.25+val_results[5]*0.25
+                                    best_model_dict['model'] = copy.deepcopy(model.state_dict())
+                                    best_model_dict['epoch'] = epoch
+                                    best_epoch=epoch
+                                train_losses_last = train_losses
+                                total_losses.update(train_losses.sum)
+                            
                     model.load_state_dict(best_model_dict['model'])
                     end = time.time()
                     print("epoch",best_model_dict['epoch'])
-                    test_results = test(test_dataloder,model,loss_model,epoch,logger)
+                    test_results = test(test_dataloder,model,loss_model,epoch,logger, selected_view)
                     test_acc_list.append(test_results[0])
                     test_one_error_list.append(test_results[1])
                     test_coverage_list.append(test_results[2])

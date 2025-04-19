@@ -4,6 +4,49 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F 
 
+def compute_cosine_similarity(z_sample, z_sample_list_p):
+    """
+    计算共享特征和私有特征之间的正交损失
+    使用线性变换：loss = 1 - (cos_similarity + 1)/2
+    Args:
+        z_sample: 共享特征 [batch_size, feature_dim]
+        z_sample_list_p: 私有特征列表 list of [batch_size, feature_dim]
+    Returns:
+        orthogonal_loss: 正交损失
+    """
+    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+    total_loss = 0
+    for z_p in z_sample_list_p:
+        cos_similarity = cos(z_sample, z_p)  # [batch_size]
+        # 使用线性变换将余弦相似度转换为损失
+        loss = 1 - ((cos_similarity + 1) / 2)  # 映射到[0,1]区间
+        total_loss += torch.mean(loss)
+    return total_loss / len(z_sample_list_p)
+
+def compute_cosine_similarity_list(z_sample_view_s, z_sample_view_p):
+    """
+    计算每个视图的共享特征和私有特征之间的余弦相似度
+    Args:
+        z_sample_view_s: 视图共享特征 list of [batch_size, feature_dim]
+        z_sample_view_p: 视图私有特征 list of [batch_size, feature_dim]
+    Returns:
+        cos_loss: 余弦相似度损失
+    """
+    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+    total_loss = 0
+    
+    # 确保两个列表长度相同
+    assert len(z_sample_view_s) == len(z_sample_view_p)
+    
+    # 对每个视图分别计算其共享特征和私有特征的余弦相似度
+    for z_s, z_p in zip(z_sample_view_s, z_sample_view_p):
+        cos_similarity = cos(z_s, z_p)  # [batch_size]
+        # 使用线性变换将余弦相似度转换为损失
+        loss = 1 - ((cos_similarity + 1) / 2)  # 映射到[0,1]区间
+        total_loss += torch.mean(loss)
+    
+    return total_loss / len(z_sample_view_s)
+
 def manual_gaussian_log_prob_stable(x, mu, var, eps=1e-8):
     """更稳定的手动高斯分布对数概率计算
     
@@ -297,7 +340,11 @@ class VAE(nn.Module):
         fusion_mu, fusion_sca = self.poe_aggregate(z_mu, z_sca, mask=None)
         # 进行重参数化，从融合分布采样潜在变量z_sample
         z_sample = gaussian_reparameterization_var(fusion_mu, fusion_sca,times=10)
-           
+        z_sample_list_s = []
+        for i in range(len(sca_s_list)):
+            z_sample_view_s = gaussian_reparameterization_var(mu_s_list[i], sca_s_list[i], times=5)
+            z_sample_list_s.append(z_sample_view_s)
+
         z_sample_list_p = []
         for i in range(len(sca_s_list)):
             z_sample_view_p = gaussian_reparameterization_var(mu_p_list[i], sca_p_list[i], times=5)
@@ -309,37 +356,9 @@ class VAE(nn.Module):
         for v in range(self.num_views):
             reconstruct_x_p = self.px_generation_p[v](z_sample_list_p[v])
             xr_p_list.append(reconstruct_x_p)
-
-        # 计算互信息损失 - 使用Independent分布来处理多维情况
-        pos_I_y_zxp_mean = 0
-
-        # 遍历所有可能的视图对(i,j)，其中i≠j
-        for i in range(self.num_views):
-            # 为视图i创建私有表示的对数概率
-            sca_p_positive_i = F.softplus(sca_p_list[i]) + 1e-6
-            
-            # 手动计算视图i的私有表示的对数概率
-            i_log_prob = manual_gaussian_log_prob_stable(
-                z_sample_list_p[i], 
-                mu_p_list[i], 
-                sca_p_positive_i
-            ).mean()
-            
-            for j in range(self.num_views):
-                if i != j:  # 不计算自身与自身的互信息
-                    # 计算视图j的先验对数概率（使用标准正态分布）
-                    j_prior_log_prob = manual_gaussian_log_prob_stable(
-                        z_sample_list_p[j], 
-                        self.mu2.expand_as(z_sample_list_p[j]), 
-                        self.sigma.expand_as(z_sample_list_p[j]) ** 2
-                    ).mean()
-                    
-                    # 计算视图i的私有表示与视图j的先验之间的互信息
-                    pos_I_y_zxp = i_log_prob - j_prior_log_prob
-                    pos_I_y_zxp_mean += pos_I_y_zxp
         
-        # 总互信息损失
-        pos_beta_I = pos_I_y_zxp_mean / (self.num_views*(self.num_views-1))
-        pos_beta_I = torch.clamp(pos_beta_I, min=0.0)
-        
-        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, pos_beta_I
+        # 计算私有特征z_sample_list_p和共享特征z_sample的余弦相似度
+        # cos_loss = compute_cosine_similarity(z_sample, z_sample_list_p)
+        cos_loss = compute_cosine_similarity_list(z_sample_list_s, z_sample_list_p)
+
+        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p

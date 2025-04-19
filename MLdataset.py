@@ -70,7 +70,7 @@ class IncDataset(Dataset):
         else:
             self.cur_mv_data = [v_data[self.train_sample_num + self.val_sample_num:] for v_data in inc_mv_data]
             self.cur_labels = labels[self.train_sample_num + self.val_sample_num:]
-            self.cur_qinc_V_ind = inc_V_ind[self.train_sample_num + self.val_sample_num:]
+            self.cur_inc_V_ind = inc_V_ind[self.train_sample_num + self.val_sample_num:]
             self.cur_inc_L_ind = np.ones_like(self.cur_labels)
         self.mode = mode
         self.classes_num = labels.shape[1]
