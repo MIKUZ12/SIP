@@ -4,7 +4,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F 
 
-def compute_cosine_similarity(z_sample, z_sample_list_p):
+def compute_cosine_similarity(z_1, z_2):
     """
     计算共享特征和私有特征之间的正交损失
     使用线性变换：loss = 1 - (cos_similarity + 1)/2
@@ -16,12 +16,11 @@ def compute_cosine_similarity(z_sample, z_sample_list_p):
     """
     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
     total_loss = 0
-    for z_p in z_sample_list_p:
-        cos_similarity = cos(z_sample, z_p)  # [batch_size]
-        # 使用线性变换将余弦相似度转换为损失
-        loss = 1 - ((cos_similarity + 1) / 2)  # 映射到[0,1]区间
-        total_loss += torch.mean(loss)
-    return total_loss / len(z_sample_list_p)
+    cos_similarity = cos(z_1, z_2)  # [batch_size]
+    # 使用线性变换将余弦相似度转换为损失
+    loss = 1 - ((cos_similarity + 1) / 2)  # 映射到[0,1]区间
+    total_loss += torch.mean(loss)
+    return total_loss
 
 def compute_cosine_similarity_list(z_sample_view_s, z_sample_view_p):
     """
@@ -202,17 +201,20 @@ class VAE(nn.Module):
     # self.switch_layers = switch_layers(z_dim,self.num_views)
         self.z_inference_s = []
         self.z_inference_p = []
-
+        self.mapinference = []
         self.mu2 = nn.Parameter(torch.full((self.z_dim,),1.), requires_grad=False)
         self.sigma = nn.Parameter(torch.full((self.z_dim,),2.), requires_grad=False)
         self.prior2 = torch.distributions.Normal(loc=self.mu2, scale=self.sigma)
         self.prior2 = torch.distributions.Independent(self.prior2, 1)
+        
         # 为每一个视图都创建一个独立的编码器
         for v in range(self.num_views):
             self.z_inference_s.append(inference_mlp(self.x_dim_list[v], self.z_dim))
             self.z_inference_p.append(inference_mlp(self.x_dim_list[v], self.z_dim))
+            self.mapinference.append(inference_mlp(self.x_dim_list[v], self.z_dim))
         self.qz_inference_s = nn.ModuleList(self.z_inference_s)
         self.qz_inference_p = nn.ModuleList(self.z_inference_p)
+        self.mapinference = nn.ModuleList(self.mapinference)
         self.qz_inference = nn.ModuleList([inference_mlp(self.x_dim_list[v], self.z_dim) for v in range(self.num_views)])
         # 定义共享潜在分布的推理模块,通过 MLP 提取特征，再通过线性层分别输出潜在分布的均值z_loc和方差z_sca(使用 Softplus 确保正性)
         self.qz_inference_header = sharedQz_inference_mlp(self.z_dim, self.z_dim)
@@ -226,58 +228,30 @@ class VAE(nn.Module):
         self.px_generation_p = nn.ModuleList(self.x_generation_p)
         self.px_generation = nn.ModuleList([Px_generation_mlp(self.z_dim, self.x_dim_list[v]) for v in range(self.num_views)])
     def inference_z(self, x_list):
-        # uniview_mu_list = []
-        # uniview_sca_list = []
         uniview_mu_s_list = []
         uniview_sca_s_list = []
         uniview_mu_p_list = []
         uniview_sca_p_list = []
+        fea_list = []
+        fea_p_list = []
         for v in range(self.num_views):
             if torch.sum(torch.isnan(x_list[v])).item() > 0:
                 print("zzz:nan")
                 pass
             # 每一个view都通过qz_inference提取特征
-            # fea = self.qz_inference[v](x_list[v])
             fea_s = self.qz_inference_s[v](x_list[v])
             fea_p = self.qz_inference_p[v](x_list[v])
-            # if torch.sum(torch.isnan(fea)).item() > 0:
-            #     print("zz:nan")
-            #     pass
-            # 通过共享头生成每个特征的潜在分布均值和方差
-            # z_mu_v, z_sca_v = self.qz_inference_header(fea)
+
+            fea = self.mapinference[v](x_list[v])
+
             z_mu_v_s, z_sca_v_s = self.qz_inference_header(fea_s)
-            z_mu_v_p, z_sca_v_p = self.qz_inference_header(fea_p)
-            # if torch.sum(torch.isnan(z_mu_v)).item() > 0:
-            #     print("zzmu:nan")
-            #     pass
-            # if torch.sum(torch.isnan(z_sca_v)).item() > 0:
-            #     print("zzvar:nan")
-            #     pass
-            # uniview_mu_list.append(z_mu_v)
-            # uniview_sca_list.append(z_sca_v)
+
             uniview_mu_s_list.append(z_mu_v_s)
             uniview_sca_s_list.append(z_sca_v_s)
-            uniview_mu_p_list.append(z_mu_v_p)
-            uniview_sca_p_list.append(z_sca_v_p)
+            fea_list.append(fea)
+            fea_p_list.append(fea_p)
 
-
-
-
-
-        # mu = torch.stack(z_mu)
-        # sca = torch.stack(z_sca)
-        
-        ###POE aggregation
-        # fusion_mu, fusion_sca = self.poe_aggregate(mu, sca, mask)
-
-        ###weighted fusion
-        # z = []
-        # for v in range(self.num_views):
-        #     z.append(gaussian_reparameterization_var(uniview_mu_list[v], uniview_sca_list[v],times=1))
-        # z = torch.stack(z,dim=1) #[n v d]
-        # z = z.mul(mask.unsqueeze(-1)).sum(1)
-        # z = z / (mask.sum(1).unsqueeze(-1)+1e-8)
-        return uniview_mu_s_list, uniview_sca_s_list, uniview_mu_p_list, uniview_sca_p_list
+        return uniview_mu_s_list, uniview_sca_s_list, fea_p_list, fea_list
     
     def generation_x(self, z):
         xr_dist = []
@@ -326,15 +300,12 @@ class VAE(nn.Module):
     
     def forward(self, x_list, mask=None):
         # 先将多视图数据x_list 输入inference模块，计算出每一个view的特征的潜在均值和方差
-        mu_s_list, sca_s_list, mu_p_list, sca_p_list = self.inference_z(x_list)
+        mu_s_list, sca_s_list, fea_p_list, fea_list = self.inference_z(x_list)
         z_mu = torch.stack(mu_s_list,dim=0) # [v n d]
         z_sca = torch.stack(sca_s_list,dim=0) # [v n d]
         if torch.sum(torch.isnan(z_mu)).item() > 0:
             print("z:nan")
             pass
-        # if self.training:
-        #     z_mu = fill_with_label(label_embedding_mu,label,z_mu,mask)
-        #     z_sca = fill_with_label(label_embedding_var,label,z_sca,mask)
         # 通过poe融合技术将先前计算出来的每一个view的均值和方差进行融合
         # 在sip这篇文章中，fusion得到的结果就是共享信息
         fusion_mu, fusion_sca = self.poe_aggregate(z_mu, z_sca, mask=None)
@@ -344,21 +315,16 @@ class VAE(nn.Module):
         for i in range(len(sca_s_list)):
             z_sample_view_s = gaussian_reparameterization_var(mu_s_list[i], sca_s_list[i], times=5)
             z_sample_list_s.append(z_sample_view_s)
-
-        z_sample_list_p = []
-        for i in range(len(sca_s_list)):
-            z_sample_view_p = gaussian_reparameterization_var(mu_p_list[i], sca_p_list[i], times=5)
-            z_sample_list_p.append(z_sample_view_p)
         
         # 使用generation从采样的z中重构视图，结果是一个list，是每个视图的表示
         xr_list = self.generation_x(z_sample)
         xr_p_list = []
         for v in range(self.num_views):
-            reconstruct_x_p = self.px_generation_p[v](z_sample_list_p[v])
+            reconstruct_x_p = self.px_generation_p[v](fea_p_list[v])
             xr_p_list.append(reconstruct_x_p)
         
         # 计算私有特征z_sample_list_p和共享特征z_sample的余弦相似度
         # cos_loss = compute_cosine_similarity(z_sample, z_sample_list_p)
-        cos_loss = compute_cosine_similarity_list(z_sample_list_s, z_sample_list_p)
+        cos_loss = compute_cosine_similarity_list(z_sample_list_s, fea_p_list)
 
-        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p
+        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, cos_loss, fea_p_list, fea_list

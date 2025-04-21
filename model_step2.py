@@ -11,7 +11,6 @@ from torch.nn import Parameter
 import torch.nn.functional as F
 from layers_new import GIN, FDModel, MLP,GAT
 from model_VAE_new import VAE
-from model_VAE_new import compute_cosine_similarity
 
 def gaussian_reparameterization_std(means, std, times=1):
     std = std.abs()
@@ -205,7 +204,7 @@ class Net(nn.Module):
         assert torch.sum(torch.isinf(aggregate_var)).item()==0
         return aggregate_mu, aggregate_var
     
-    def forward(self, x_list, mask):
+    def forward(self, x_list, fusion_z_mu1_batch, fusion_z_sca1_batch, mask):
         # Generating semantic label embeddings via label semantic encoding module
         # label_embedding = self.GIN_encoder(self.label_embedding, self.label_adj)
         # print(self.label_adj[:10,:10])
@@ -227,14 +226,17 @@ class Net(nn.Module):
         # x_list是输入的data，mask是掩码
         # fusion_z是共享信息的均值和方差，这一项需要引出
         # 同样的，我们也需要引出私有的均值和方差以便下一阶段做loss
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list = self.VAE(x_list, mask)  #Z[i]=[128, 260, 512] b c d_e
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list = self.VAE(x_list,mask)
         if torch.sum(torch.isnan(z_sample)).item() > 0:
             pass
-        # 把fea_list除了最后一个元素的所有元素拼接起来
-        fea_concat = torch.cat(fea_list[:-1], dim=1)
-        mapped_fea = self.mlp_2view(fea_concat)
-        mapped_data = self.VAE.px_generation[-1](mapped_fea)
-
+        # 将fusion_z_mu, fusion_z_sca和fusion_z_mu1_batch, fusion_z_sca1_batch堆叠成一个torch列表
+        fusion_z_mu_list = [fusion_z_mu, fusion_z_mu1_batch]
+        fusion_z_sca_list = [fusion_z_sca, fusion_z_sca1_batch]
+        fusion_mu = torch.stack(fusion_z_mu_list, dim=0)
+        fusion_sca = torch.stack(fusion_z_sca_list, dim=0)
+        fusion_mu, fusion_sca = self.VAE.poe_aggregate(fusion_mu, fusion_sca)
+        z_sample = gaussian_reparameterization_var(fusion_mu, fusion_sca,times=10)
+        
         z_sample = self.bn(z_sample)
         z_sample = F.relu(z_sample)
         # 对z_sample_list_p都做一遍这个bn和relu操作
@@ -278,10 +280,9 @@ class Net(nn.Module):
         p_fused = weights_normalized[0] * p_s + weights_normalized[1] * p_p0 + weights_normalized[2] * p_p1
         assert torch.all((p_fused >= 0) & (p_fused <= 1)), "Prediction values out of valid range"
         p_fused = torch.where(torch.isnan(p_fused), torch.zeros_like(p_fused), p_fused)
+        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, z_sample_list_p
 
-        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, z_sample_list_p, mapped_data
-
-def get_model(d_list,num_classes,z_dim,adj,rand_seed=0):
+def get_model2(d_list,num_classes,z_dim,adj,rand_seed=0):
     model = Net(d_list,num_classes=num_classes,z_dim=z_dim,adj=adj,rand_seed=rand_seed)
     model = model.to(torch.device('cuda' if torch.cuda.is_available() 
                                     else 'cpu'))
@@ -292,7 +293,7 @@ if __name__=="__main__":
     from MLdataset import getIncDataloader
     dataloder,dataset = getIncDataloader('/disk/MATLAB-NOUPLOAD/MyMVML-data/corel5k/corel5k_six_view.mat','/disk/MATLAB-NOUPLOAD/MyMVML-data/corel5k/corel5k_six_view_MaskRatios_0_LabelMaskRatio_0_TraindataRatio_0.7.mat',training_ratio=0.7,mode='train',batch_size=3,num_workers=2)
     input = next(iter(dataloder))[0]
-    model=get_model(num_classes=260,beta=0.2,in_features=1,class_emb=260,rand_seed=0)
+    model=get_model2(num_classes=260,beta=0.2,in_features=1,class_emb=260,rand_seed=0)
     input = [v_data.to('cuda:0') for v_data in input]
     # print(input[0])
     pred,_,_=model(input)
