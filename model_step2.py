@@ -10,7 +10,7 @@ from torch.autograd import Variable
 from torch.nn import Parameter
 import torch.nn.functional as F
 from layers_new import GIN, FDModel, MLP,GAT
-from model_VAE_new import VAE
+from model_VAE_new2 import VAE
 
 def gaussian_reparameterization_std(means, std, times=1):
     std = std.abs()
@@ -204,11 +204,13 @@ class Net(nn.Module):
         assert torch.sum(torch.isinf(aggregate_var)).item()==0
         return aggregate_mu, aggregate_var
     
-    def forward(self, x_list, z_mu, z_sca, mask):
+    def forward(self, x_list, z_mu, z_sca, map_fea, mask):
         # Generating semantic label embeddings via label semantic encoding module
         # label_embedding = self.GIN_encoder(self.label_embedding, self.label_adj)
         # print(self.label_adj[:10,:10])
         label_embedding  =  self.label_embedding_u
+        step = 2
+
         # 这里还需要修改，此处是默认取了第一个视图作为保留视图(索引0)
         # label_embedding = gaussian_reparameterization_std(self.label_embedding_u,self.label_embedding_std)
         #label_embedding = self.GAT_encoder(label_embedding, self.adj)
@@ -226,7 +228,7 @@ class Net(nn.Module):
         # x_list是输入的data，mask是掩码
         # fusion_z是共享信息的均值和方差，这一项需要引出
         # 同样的，我们也需要引出私有的均值和方差以便下一阶段做loss
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list, z_mu_new, z_sca_new = self.VAE(x_list,mask)
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, z_mu_new, z_sca_new = self.VAE(x_list,step, map_fea, mask)
         if torch.sum(torch.isnan(z_sample)).item() > 0:
             pass
         # 将传入的z_mu和z_sca与VAE得到的z_mu和z_sca进行拼接，二者形状是一致的

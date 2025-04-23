@@ -210,6 +210,8 @@ class Net(nn.Module):
         # label_embedding = self.GIN_encoder(self.label_embedding, self.label_adj)
         # print(self.label_adj[:10,:10])
         label_embedding  =  self.label_embedding_u
+        step = 1
+
         # label_embedding = gaussian_reparameterization_std(self.label_embedding_u,self.label_embedding_std)
         #label_embedding = self.GAT_encoder(label_embedding, self.adj)
         assert torch.sum(torch.isnan(self.label_embedding_u)).item() == 0
@@ -226,13 +228,13 @@ class Net(nn.Module):
         # x_list是输入的data，mask是掩码
         # fusion_z是共享信息的均值和方差，这一项需要引出
         # 同样的，我们也需要引出私有的均值和方差以便下一阶段做loss
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list, z_mu, z_sca = self.VAE(x_list, mask)  #Z[i]=[128, 260, 512] b c d_e
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, z_mu, z_sca, mapped_fea,map_loss = self.VAE(x_list,step,mask)  #Z[i]=[128, 260, 512] b c d_e
         if torch.sum(torch.isnan(z_sample)).item() > 0:
             pass
         # 把fea_list除了最后一个元素的所有元素拼接起来
-        fea_concat = torch.cat(fea_list[:-1], dim=1)
-        mapped_fea = self.mlp_2view(fea_concat)
-        mapped_data = self.VAE.px_generation[-1](mapped_fea)
+        # fea_concat = torch.cat(fea_list[:-1], dim=1)
+        # mapped_fea = self.mlp_2view(fea_concat)
+        # mapped_data = self.VAE.px_generation[-1](mapped_fea)
 
         z_sample = self.bn(z_sample)
         z_sample = F.relu(z_sample)
@@ -297,7 +299,7 @@ class Net(nn.Module):
         assert torch.all((p_fused >= 0) & (p_fused <= 1)), "Prediction values out of valid range"
         p_fused = torch.where(torch.isnan(p_fused), torch.zeros_like(p_fused), p_fused)
 
-        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, z_sample_list_p, mapped_data, z_mu, z_sca
+        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, z_sample_list_p, z_mu, z_sca, mapped_fea,map_loss
 
 def get_model(d_list,num_classes,z_dim,adj,rand_seed=0):
     model = Net(d_list,num_classes=num_classes,z_dim=z_dim,adj=adj,rand_seed=rand_seed)

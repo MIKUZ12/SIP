@@ -24,7 +24,7 @@ def compute_cosine_similarity(z_1, z_2):
 
 def compute_cosine_similarity_list(z_sample_view_s, z_sample_view_p):
     """
-    计算每个视图的共享特征和私有特征之间的余弦相似度
+    计算每个视图的共享特征和私有特征之间的余弦相似度，但排除z_sample_view_s的最后一个元素
     Args:
         z_sample_view_s: 视图共享特征 list of [batch_size, feature_dim]
         z_sample_view_p: 视图私有特征 list of [batch_size, feature_dim]
@@ -34,17 +34,24 @@ def compute_cosine_similarity_list(z_sample_view_s, z_sample_view_p):
     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
     total_loss = 0
     
-    # 确保两个列表长度相同
-    assert len(z_sample_view_s) == len(z_sample_view_p)
+    # 获取除最后一个元素外的z_sample_view_s
+    z_sample_view_s_filtered = z_sample_view_s[:-1]
+    
+    # 确保过滤后的z_sample_view_s和z_sample_view_p长度相同
+    assert len(z_sample_view_s_filtered) == len(z_sample_view_p), "过滤后的共享特征列表长度必须与私有特征列表长度相同"
+    
+    # 如果过滤后列表为空，返回0损失
+    if len(z_sample_view_s_filtered) == 0:
+        return torch.tensor(0.0).to(z_sample_view_s[0].device)
     
     # 对每个视图分别计算其共享特征和私有特征的余弦相似度
-    for z_s, z_p in zip(z_sample_view_s, z_sample_view_p):
+    for z_s, z_p in zip(z_sample_view_s_filtered, z_sample_view_p):
         cos_similarity = cos(z_s, z_p)  # [batch_size]
         # 使用线性变换将余弦相似度转换为损失
         loss = 1 - ((cos_similarity + 1) / 2)  # 映射到[0,1]区间
         total_loss += torch.mean(loss)
     
-    return total_loss / len(z_sample_view_s)
+    return total_loss / len(z_sample_view_s_filtered)
 
 def manual_gaussian_log_prob_stable(x, mu, var, eps=1e-8):
     """更稳定的手动高斯分布对数概率计算
@@ -246,15 +253,14 @@ class VAE(nn.Module):
             fea_p_list.append(fea_p)
         fea_concat = torch.cat(fea_s_list[:-1], dim=1)
         mapped_fea = self.mlp_2view(fea_concat)
-        map_loss = F.mse_loss(mapped_fea, fea_s_list[-1])
         fea_s_list[-1] = mapped_fea
         for fea_s in (fea_s_list):
             z_mu_v_s, z_sca_v_s = self.qz_inference_header(fea_s)
             uniview_mu_s_list.append(z_mu_v_s)
             uniview_sca_s_list.append(z_sca_v_s)
-        return uniview_mu_s_list, uniview_sca_s_list, fea_p_list, mapped_fea, map_loss
+        return uniview_mu_s_list, uniview_sca_s_list, fea_p_list
     
-    def inference_z2(self, x_list):
+    def inference_z2(self, x_list, map_fea):
         uniview_mu_s_list = []
         uniview_sca_s_list = []
         fea_s_list = []
@@ -267,10 +273,12 @@ class VAE(nn.Module):
             fea_s = self.qz_inference_s[v](x_list[v])
             fea_p = self.qz_inference_p[v](x_list[v])   
             fea_p_list.append(fea_p)
+            fea_s_list.append(fea_s)
+        fea_s_list.append(map_fea)
+        for fea_s in (fea_s_list):
             z_mu_v_s, z_sca_v_s = self.qz_inference_header(fea_s)
             uniview_mu_s_list.append(z_mu_v_s)
             uniview_sca_s_list.append(z_sca_v_s)
-
         return uniview_mu_s_list, uniview_sca_s_list, fea_p_list
     
     def generation_x(self, z):
@@ -318,10 +326,10 @@ class VAE(nn.Module):
         aggregate_mu = exist_mu.sum(dim=0)
         return aggregate_mu,aggregate_var
     
-    def forward(self, x_list, step, mask=None):
+    def forward(self, x_list, step, map_fea, mask=None):
         # 先将多视图数据x_list 输入inference模块，计算出每一个view的特征的潜在均值和方差
-        if (step == 1):
-            mu_s_list, sca_s_list, fea_p_list, mapped_fea, map_loss = self.inference_z1(x_list)
+        if (step == 2):
+            mu_s_list, sca_s_list, fea_p_list = self.inference_z2(x_list, map_fea)
         z_mu = torch.stack(mu_s_list,dim=0) # [v n d]
         z_sca = torch.stack(sca_s_list,dim=0) # [v n d]
         if torch.sum(torch.isnan(z_mu)).item() > 0:
@@ -348,4 +356,4 @@ class VAE(nn.Module):
         # cos_loss = compute_cosine_similarity(z_sample, z_sample_list_p)
         cos_loss = compute_cosine_similarity_list(z_sample_list_s, fea_p_list)
 
-        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, cos_loss, fea_p_list, z_mu, z_sca, mapped_fea, map_loss
+        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, cos_loss, fea_p_list, z_mu, z_sca
