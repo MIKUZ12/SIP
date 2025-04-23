@@ -210,9 +210,8 @@ class Net(nn.Module):
         # label_embedding = self.GIN_encoder(self.label_embedding, self.label_adj)
         # print(self.label_adj[:10,:10])
         label_embedding  =  self.label_embedding_u
-        # 这里还需要修改，此处是默认取了第一个视图作为保留视图(索引0)
         # label_embedding = gaussian_reparameterization_std(self.label_embedding_u,self.label_embedding_std)
-        # label_embedding = self.GAT_encoder(label_embedding, self.adj)
+        #label_embedding = self.GAT_encoder(label_embedding, self.adj)
         assert torch.sum(torch.isnan(self.label_embedding_u)).item() == 0
         assert torch.sum(torch.isinf(self.label_embedding_u)).item() == 0
         # 将标签的嵌入label_embedding_u（初始化为一个大小为num_classes*num_classes的对角矩阵）输入进变分推断的encoder，得到高斯分布的均值和幅度sca
@@ -227,7 +226,7 @@ class Net(nn.Module):
         # x_list是输入的data，mask是掩码
         # fusion_z是共享信息的均值和方差，这一项需要引出
         # 同样的，我们也需要引出私有的均值和方差以便下一阶段做loss
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list = self.VAE(x_list, mask)  #Z[i]=[128, 260, 512] b c d_e
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list, z_mu, z_sca = self.VAE(x_list, mask)  #Z[i]=[128, 260, 512] b c d_e
         if torch.sum(torch.isnan(z_sample)).item() > 0:
             pass
         # 把fea_list除了最后一个元素的所有元素拼接起来
@@ -240,33 +239,48 @@ class Net(nn.Module):
         # 对z_sample_list_p都做一遍这个bn和relu操作
         z_sample_list_p = [self.bn(z) for z in z_sample_list_p]
         z_sample_list_p = [F.relu(z) for z in z_sample_list_p]
-        # z_sample是从编码器得到的混合分布中采样的潜在变量，label_embedding_sample是标签嵌入之后采样的潜在标签，然后连接起来
-        qc_z = torch.cat((z_sample.unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample.shape[0],1,1)),dim=-1)
-        # 连接起来的潜在特征经过一个fully connected layer
-        p_s = self.cls_conv(qc_z).squeeze(-1)
-
-        qc_p0 = torch.cat((z_sample_list_p[0].unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[0].shape[0],1,1)),dim=-1)
-        qc_p1 = torch.cat((z_sample_list_p[1].unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[1].shape[0],1,1)),dim=-1)     
-        p_p0 = self.cls_conv(qc_p0).squeeze(-1)
-        p_p1 = self.cls_conv(qc_p1).squeeze(-1)
         
-        # 再经过一次sigmoid，以上三步对应的是论文（公式11）
+        # 首先处理共享特征
+        qc_z = torch.cat((z_sample.unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),
+                        label_embedding_sample.unsqueeze(0).repeat(z_sample.shape[0],1,1)),dim=-1)
+        p_s = self.cls_conv(qc_z).squeeze(-1)
         p_s = torch.sigmoid(p_s)
-        p_p0 = torch.sigmoid(p_p0)
-        p_p1 = torch.sigmoid(p_p1)
 
-        # 计算每个分类器的交叉熵损失
+        # 动态处理每个视图的预测
+        view_predictions = []
+        view_losses = []
+        view_weights = []
+
+        # 首先添加共享特征的预测和损失
+        view_predictions.append(p_s)
         loss_s = - (p_s * torch.log(p_s + 1e-5) + (1 - p_s) * torch.log(1 - p_s + 1e-5))
-        loss_p0 = - (p_p0 * torch.log(p_p0 + 1e-5) + (1 - p_p0) * torch.log(1 - p_p0 + 1e-5))
-        loss_p1 = - (p_p1 * torch.log(p_p1 + 1e-5) + (1 - p_p1) * torch.log(1 - p_p1 + 1e-5))
+        view_losses.append(loss_s)
 
-        # 计算损失的倒数作为权重，对为0的损失设置权重为0
+        # 处理每个视图特定的特征
+        for i in range(len(z_sample_list_p)):
+            # 构建当前视图的输入
+            qc_p = torch.cat((z_sample_list_p[i].unsqueeze(1).repeat(1, label_embedding_sample.shape[0], 1),
+                            label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[i].shape[0], 1, 1)), dim=-1)
+            
+            # 通过分类器得到预测
+            p_p = self.cls_conv(qc_p).squeeze(-1)
+            p_p = torch.sigmoid(p_p)
+            view_predictions.append(p_p)
+            
+            # 计算损失
+            loss_p = - (p_p * torch.log(p_p + 1e-5) + (1 - p_p) * torch.log(1 - p_p + 1e-5))
+            view_losses.append(loss_p)
+            
+            # 计算权重
+            weight_p = torch.where(loss_p > 1e-5, 1.0 / (loss_p + 1e-5), torch.zeros_like(loss_p))
+            view_weights.append(weight_p)
+
+        # 计算共享特征的权重
         weight_s = torch.where(loss_s > 1e-5, 1.0 / (loss_s + 1e-5), torch.zeros_like(loss_s))
-        weight_p0 = torch.where(loss_p0 > 1e-5, 1.0 / (loss_p0 + 1e-5), torch.zeros_like(loss_p0))
-        weight_p1 = torch.where(loss_p1 > 1e-5, 1.0 / (loss_p1 + 1e-5), torch.zeros_like(loss_p1))
+        view_weights.insert(0, weight_s)  # 将共享特征的权重放在第一位
 
-        # 合并权重
-        weights = torch.stack([weight_s, weight_p0, weight_p1])
+        # 合并所有权重
+        weights = torch.stack(view_weights)
         weight_sum = weights.sum(dim=0, keepdim=True)  # 按第一维求和
 
         # 避免所有元素都是0的情况，防止归一化出错
@@ -274,12 +288,16 @@ class Net(nn.Module):
                                         weights / weight_sum, 
                                         torch.zeros_like(weights))
 
-        # 对三个分类器的预测结果进行加权融合
-        p_fused = weights_normalized[0] * p_s + weights_normalized[1] * p_p0 + weights_normalized[2] * p_p1
+        # 动态加权融合所有视图的预测结果
+        p_fused = torch.zeros_like(view_predictions[0])
+        for i in range(len(view_predictions)):
+            p_fused += weights_normalized[i] * view_predictions[i]
+
+        # 确保最终预测在合理范围内
         assert torch.all((p_fused >= 0) & (p_fused <= 1)), "Prediction values out of valid range"
         p_fused = torch.where(torch.isnan(p_fused), torch.zeros_like(p_fused), p_fused)
 
-        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, z_sample_list_p, mapped_data
+        return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, z_sample_list_p, mapped_data, z_mu, z_sca
 
 def get_model(d_list,num_classes,z_dim,adj,rand_seed=0):
     model = Net(d_list,num_classes=num_classes,z_dim=z_dim,adj=adj,rand_seed=rand_seed)

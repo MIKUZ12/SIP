@@ -56,7 +56,7 @@ def train_step1(loader, model, loss_model, opt, sche, epoch,dep_graph,last_preds
         inc_V_ind = inc_V_ind.float().to('cuda:0')
         inc_L_ind = inc_L_ind.float().to('cuda:0')
         # data是多视图的信息
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, pred, xr_p_list, cos_loss, z_sample_list_p1, map_data = model(data_selected, mask=inc_V_ind)
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, pred, xr_p_list, cos_loss, z_sample_list_p1, map_data, _, _ = model(data_selected, mask=inc_V_ind)
         All_preds = torch.cat([All_preds,pred],dim=0) # 融合之后的预测输出
 
         if epoch<args.pre_epochs:
@@ -83,7 +83,8 @@ def train_step1(loader, model, loss_model, opt, sche, epoch,dep_graph,last_preds
             cos_loss = cos_loss
             assert torch.sum(torch.isnan(loss_mse)).item() == 0
             # loss = loss_CL + loss_mse *args.alpha + z_c_loss*args.beta + cohr_loss *args.sigma + loss_mse_p + 0.01*loss_pos_beta_I + mapping_loss
-            loss = loss_CL + loss_mse  + cohr_loss + cos_loss*0.1 + loss_mse_p*0.1 + mapped_loss
+            loss = loss_CL + loss_mse  + cohr_loss + cos_loss*0.1 + loss_mse_p*0.1 + mapped_loss*0.1 + z_c_loss*0.001
+            # loss = loss_CL + loss_mse *args.alpha + z_c_loss*args.beta + cohr_loss *args.sigma + loss_mse_p *args.alpha + mapped_loss*0.01
             # 打印出所有的loss
             # 打印出所有的loss
             if(i % 20 == 0):
@@ -130,13 +131,13 @@ def train_step2(loader, model, model_last, loss_model, opt, sche, epoch,dep_grap
             # 准备第一阶段模型的输入
             data_view_1 = [data[i] for i in selected_view_last]  # 使用第一阶段的视图选择
             # 使用第一阶段模型生成当前批次对应的输出
-            _, _, _, fusion_z_mu1_batch, fusion_z_sca1_batch, _, _, _, _, _, z_sample_list_p1_batch, mapped_data = model_last(data_view_1, mask=inc_V_ind)
+            _, _, _, fusion_z_mu1_batch, fusion_z_sca1_batch, _, _, _, _, _, z_sample_list_p1_batch, mapped_data, z_mu, z_sca= model_last(data_view_1, mask=inc_V_ind)
         data_selected.append(mapped_data)
         label = label.to('cuda:0')
         inc_V_ind = inc_V_ind.float().to('cuda:0')
         inc_L_ind = inc_L_ind.float().to('cuda:0')
         # data是多视图的信息
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, pred, xr_p_list, cos_loss, z_sample_list_p2 = model(data_selected, fusion_z_mu1_batch, fusion_z_sca1_batch,mask=inc_V_ind)
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, pred, xr_p_list, cos_loss, z_sample_list_p2 = model(data_selected, z_mu, z_sca,mask=inc_V_ind)
         All_preds = torch.cat([All_preds,pred],dim=0) # 融合之后的预测输出
 
         if epoch<args.pre_epochs:
@@ -154,7 +155,6 @@ def train_step2(loader, model, model_last, loss_model, opt, sche, epoch,dep_grap
             cohr_loss = loss_model.corherent_loss(uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca,mask=inc_V_ind)
             loss_mse = 0
             loss_mse_p = 0
-            loss_pos_beta_I = 0
             for v in range(len(data_selected)-1):
                 ## xr_list是每个重构的视图，这个损失是用来约束VAE的，使得潜在空间的特征能够很好的表征原数据
                 ## 对应（公式7）的第一项，最大化重构概率，对应最大化互信息的下界
@@ -165,7 +165,10 @@ def train_step2(loader, model, model_last, loss_model, opt, sche, epoch,dep_grap
 
             assert torch.sum(torch.isnan(loss_mse)).item() == 0
             # loss = loss_CL + loss_mse *args.alpha + z_c_loss*args.beta + cohr_loss *args.sigma + loss_mse_p + 0.01*loss_pos_beta_I + mapping_loss
-            loss = loss_CL + loss_mse + cohr_loss + cos_loss*0.1 + loss_mse_p*0.1 + loss_private + loss_public
+            loss = loss_CL*3 + loss_mse + cohr_loss + cos_loss*0.1 + loss_mse_p*0.1 + loss_private*0.01 + loss_public*0.01 + z_c_loss*0.001
+            # 把所有的loss打印出来
+            if(i % 20 == 0):
+                logger.info(f"epoch[{epoch}]_Batch[{i}] - CLS:{loss_CL.item():.4f} | MSE:{loss_mse.item():.4f} | MSE_P:{loss_mse_p.item():.4f} | COH:{cohr_loss.item():.4f} | COS:{(cos_loss*0.1).item():.4f} | TOT:{loss.item():.4f}")
             
         opt.zero_grad()
         loss.backward()
@@ -200,7 +203,7 @@ def test(loader, model, loss_model, epoch, logger, selected_view):
         data=[v_data.to('cuda:0') for v_data in data]
         data_selected = [data[i] for i in selected_view]
         # pred,_,_ = model(data,mask=torch.ones_like(inc_V_ind).to('cuda:0'))
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, qc, xr_p_list, cos_loss, z_sample_list_p1, map_cos = model(data_selected,mask=inc_V_ind.to('cuda:0'))
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_emb_sample, qc, xr_p_list, cos_loss, z_sample_list_p1, map_cos,_,_ = model(data_selected,mask=inc_V_ind.to('cuda:0'))
         # qc_x = vade_trick(fusion_z_mu, model.mix_prior, model.mix_mu, model.mix_sca)
         pred = qc
         pred = pred.cpu()
@@ -246,10 +249,10 @@ def test2(loader, model, model_last, loss_model, epoch, logger, selected_view, s
             # 准备第一阶段模型的输入
             data_view_1 = [data[i] for i in selected_view_last]  # 使用第一阶段的视图选择
             # 使用第一阶段模型生成当前批次对应的输出
-            _, _, _, fusion_z_mu1_batch, fusion_z_sca1_batch, _, _, _, _, _, z_sample_list_p1_batch, mapped_data = model_last(data_view_1, mask=inc_V_ind)
+            _, _, _, fusion_z_mu1_batch, fusion_z_sca1_batch, _, _, _, _, _, z_sample_list_p1_batch, mapped_data,z_mu,z_sca = model_last(data_view_1, mask=inc_V_ind)
         data_selected.append(mapped_data)
         # pred,_,_ = model(data,mask=torch.ones_like(inc_V_ind).to('cuda:0'))
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, qc, xr_p_list, cos_loss, z_sample_list_p= model(data_selected,fusion_z_mu1_batch, fusion_z_sca1_batch,mask=inc_V_ind.to('cuda:0'))
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, qc, xr_p_list, cos_loss, z_sample_list_p = model(data_selected,z_mu, z_sca,mask=inc_V_ind.to('cuda:0'))
         # qc_x = vade_trick(fusion_z_mu, model.mix_prior, model.mix_mu, model.mix_sca)
         pred = qc
         pred = pred.cpu()
@@ -359,7 +362,7 @@ def main(args,file_path):
                     selected_view_last =[]
                     for epoch in range(args.epochs):
                         if (epoch <= bound):
-                            selected_view = [0,1,2,3,4]
+                            selected_view = [1,2,3,4,5]
                             selected_view_last = selected_view
                             # 此处默认第一个元素是存活视图，第二个元素是即将消失的视图，映射关系是 第一个元素 --> 第二个元素
                             print("selected_view: ",selected_view)
@@ -381,7 +384,7 @@ def main(args,file_path):
                                 train_losses_last = train_losses
                                 total_losses.update(train_losses.sum)
                         else:
-                            selected_view = [5,0,1,2,3]
+                            selected_view = [5,0,2,3,4]
                             print("selected_view: ",selected_view)
                             d_list_selected = [train_dataset.d_list[i] for i in selected_view]
                             if epoch == bound + 1:  # 只在进入第二阶段的第一个epoch初始化
@@ -390,9 +393,9 @@ def main(args,file_path):
                                 model_2 = get_model2(d_list_selected,num_classes=classes_num,z_dim=args.z_dim,adj=dep_graph,rand_seed=0)
                                 model_2 = model_2.to('cuda:0')
                                 model_1.load_state_dict(best_model_dict1['model'])  # 确保model_1加载了最佳状态
-                                with torch.no_grad():
-                                    model_2.label_embedding_u.data.copy_(model_1.label_embedding_u.data)
-                                    print("已成功从第一阶段继承标签嵌入参数")
+                                # with torch.no_grad():
+                                #     model_2.label_embedding_u.data.copy_(model_1.label_embedding_u.data)
+                                #     print("已成功从第一阶段继承标签嵌入参数")
                                 optimizer_2 = Adam(model_2.parameters(), lr=args.lr, weight_decay=args.weight_decay)
                             if epoch==0:
                                 All_preds = None
@@ -416,7 +419,7 @@ def main(args,file_path):
                     model_2.load_state_dict(best_model_dict2['model'])
                     end = time.time()
                     print("epoch",best_model_dict2['epoch'])
-                    test_results = test(test_dataloder,model_2,loss_model,epoch,logger, selected_view)
+                    test_results = test2(test_dataloder, model_2, model_1, loss_model, epoch, logger, selected_view, selected_view_last)
                     test_acc_list.append(test_results[0])
                     test_one_error_list.append(test_results[1])
                     test_coverage_list.append(test_results[2])
@@ -515,7 +518,7 @@ if __name__ == '__main__':
     # Optimization args
     parser.add_argument('--lr', type=float, default=1)
     parser.add_argument('--momentum', type=float, default=0.9)
-    parser.add_argument('--weight_decay', type=float, default=1e-6)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--epochs', type=int, default=60) #200 for corel5k  100 for iaprtc12 50 for pascal07 30 for espgame
     parser.add_argument('--pre_epochs', type=int, default=0)
     # Training args

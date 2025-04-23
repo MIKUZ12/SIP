@@ -204,14 +204,14 @@ class Net(nn.Module):
         assert torch.sum(torch.isinf(aggregate_var)).item()==0
         return aggregate_mu, aggregate_var
     
-    def forward(self, x_list, fusion_z_mu1_batch, fusion_z_sca1_batch, mask):
+    def forward(self, x_list, z_mu, z_sca, mask):
         # Generating semantic label embeddings via label semantic encoding module
         # label_embedding = self.GIN_encoder(self.label_embedding, self.label_adj)
         # print(self.label_adj[:10,:10])
         label_embedding  =  self.label_embedding_u
         # 这里还需要修改，此处是默认取了第一个视图作为保留视图(索引0)
         # label_embedding = gaussian_reparameterization_std(self.label_embedding_u,self.label_embedding_std)
-        # label_embedding = self.GAT_encoder(label_embedding, self.adj)
+        #label_embedding = self.GAT_encoder(label_embedding, self.adj)
         assert torch.sum(torch.isnan(self.label_embedding_u)).item() == 0
         assert torch.sum(torch.isinf(self.label_embedding_u)).item() == 0
         # 将标签的嵌入label_embedding_u（初始化为一个大小为num_classes*num_classes的对角矩阵）输入进变分推断的encoder，得到高斯分布的均值和幅度sca
@@ -226,16 +226,14 @@ class Net(nn.Module):
         # x_list是输入的data，mask是掩码
         # fusion_z是共享信息的均值和方差，这一项需要引出
         # 同样的，我们也需要引出私有的均值和方差以便下一阶段做loss
-        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list = self.VAE(x_list,mask)
+        z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, xr_p_list, cos_loss, z_sample_list_p, fea_list, z_mu_new, z_sca_new = self.VAE(x_list,mask)
         if torch.sum(torch.isnan(z_sample)).item() > 0:
             pass
-        # 将fusion_z_mu, fusion_z_sca和fusion_z_mu1_batch, fusion_z_sca1_batch堆叠成一个torch列表
-        fusion_z_mu_list = [fusion_z_mu, fusion_z_mu1_batch]
-        fusion_z_sca_list = [fusion_z_sca, fusion_z_sca1_batch]
-        fusion_mu = torch.stack(fusion_z_mu_list, dim=0)
-        fusion_sca = torch.stack(fusion_z_sca_list, dim=0)
-        fusion_mu, fusion_sca = self.VAE.poe_aggregate(fusion_mu, fusion_sca)
-        z_sample = gaussian_reparameterization_var(fusion_mu, fusion_sca,times=10)
+        # 将传入的z_mu和z_sca与VAE得到的z_mu和z_sca进行拼接，二者形状是一致的
+        # z_mu_new = torch.cat([z_mu,z_mu_new],dim=0)
+        # z_sca_new = torch.cat([z_sca,z_sca_new],dim=0)
+        # fusion_mu, fusion_sca = self.VAE.poe_aggregate(z_mu_new, z_sca_new)
+        z_sample = gaussian_reparameterization_var(fusion_z_mu, fusion_z_sca,times=10)
         
         z_sample = self.bn(z_sample)
         z_sample = F.relu(z_sample)
@@ -247,28 +245,40 @@ class Net(nn.Module):
         # 连接起来的潜在特征经过一个fully connected layer
         p_s = self.cls_conv(qc_z).squeeze(-1)
 
-        qc_p0 = torch.cat((z_sample_list_p[0].unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[0].shape[0],1,1)),dim=-1)
-        qc_p1 = torch.cat((z_sample_list_p[1].unsqueeze(1).repeat(1,label_embedding_sample.shape[0],1),label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[1].shape[0],1,1)),dim=-1)     
-        p_p0 = self.cls_conv(qc_p0).squeeze(-1)
-        p_p1 = self.cls_conv(qc_p1).squeeze(-1)
-        
-        # 再经过一次sigmoid，以上三步对应的是论文（公式11）
+        # 创建列表存放视图预测、损失和权重
+        view_predictions = []
+        view_losses = []
+        view_weights = []
+
+        # 处理共享特征预测
         p_s = torch.sigmoid(p_s)
-        p_p0 = torch.sigmoid(p_p0)
-        p_p1 = torch.sigmoid(p_p1)
-
-        # 计算每个分类器的交叉熵损失
+        view_predictions.append(p_s)
         loss_s = - (p_s * torch.log(p_s + 1e-5) + (1 - p_s) * torch.log(1 - p_s + 1e-5))
-        loss_p0 = - (p_p0 * torch.log(p_p0 + 1e-5) + (1 - p_p0) * torch.log(1 - p_p0 + 1e-5))
-        loss_p1 = - (p_p1 * torch.log(p_p1 + 1e-5) + (1 - p_p1) * torch.log(1 - p_p1 + 1e-5))
-
-        # 计算损失的倒数作为权重，对为0的损失设置权重为0
+        view_losses.append(loss_s)
         weight_s = torch.where(loss_s > 1e-5, 1.0 / (loss_s + 1e-5), torch.zeros_like(loss_s))
-        weight_p0 = torch.where(loss_p0 > 1e-5, 1.0 / (loss_p0 + 1e-5), torch.zeros_like(loss_p0))
-        weight_p1 = torch.where(loss_p1 > 1e-5, 1.0 / (loss_p1 + 1e-5), torch.zeros_like(loss_p1))
+        view_weights.append(weight_s)
 
-        # 合并权重
-        weights = torch.stack([weight_s, weight_p0, weight_p1])
+        # 动态处理每个视图特定的预测
+        for i in range(len(z_sample_list_p)):
+            # 构建当前视图的输入
+            qc_p = torch.cat((z_sample_list_p[i].unsqueeze(1).repeat(1, label_embedding_sample.shape[0], 1),
+                            label_embedding_sample.unsqueeze(0).repeat(z_sample_list_p[i].shape[0], 1, 1)), dim=-1)
+            
+            # 计算预测
+            p_p = self.cls_conv(qc_p).squeeze(-1)
+            p_p = torch.sigmoid(p_p)
+            view_predictions.append(p_p)
+            
+            # 计算损失
+            loss_p = - (p_p * torch.log(p_p + 1e-5) + (1 - p_p) * torch.log(1 - p_p + 1e-5))
+            view_losses.append(loss_p)
+            
+            # 计算权重
+            weight_p = torch.where(loss_p > 1e-5, 1.0 / (loss_p + 1e-5), torch.zeros_like(loss_p))
+            view_weights.append(weight_p)
+
+        # 合并所有权重
+        weights = torch.stack(view_weights)
         weight_sum = weights.sum(dim=0, keepdim=True)  # 按第一维求和
 
         # 避免所有元素都是0的情况，防止归一化出错
@@ -276,8 +286,12 @@ class Net(nn.Module):
                                         weights / weight_sum, 
                                         torch.zeros_like(weights))
 
-        # 对三个分类器的预测结果进行加权融合
-        p_fused = weights_normalized[0] * p_s + weights_normalized[1] * p_p0 + weights_normalized[2] * p_p1
+        # 动态加权融合所有视图的预测结果
+        p_fused = torch.zeros_like(view_predictions[0])
+        for i in range(len(view_predictions)):
+            p_fused += weights_normalized[i] * view_predictions[i]
+
+        # 确保最终预测在合理范围内
         assert torch.all((p_fused >= 0) & (p_fused <= 1)), "Prediction values out of valid range"
         p_fused = torch.where(torch.isnan(p_fused), torch.zeros_like(p_fused), p_fused)
         return z_sample, uniview_mu_list, uniview_sca_list, fusion_z_mu, fusion_z_sca, xr_list, label_embedding_sample, p_fused, xr_p_list, cos_loss, z_sample_list_p

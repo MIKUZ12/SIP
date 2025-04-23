@@ -241,7 +241,6 @@ class VAE(nn.Module):
             # 每一个view都通过qz_inference提取特征
             fea_s = self.qz_inference_s[v](x_list[v])
             fea_p = self.qz_inference_p[v](x_list[v])
-
             fea = self.mapinference[v](x_list[v])
 
             z_mu_v_s, z_sca_v_s = self.qz_inference_header(fea_s)
@@ -301,6 +300,7 @@ class VAE(nn.Module):
     def forward(self, x_list, mask=None):
         # 先将多视图数据x_list 输入inference模块，计算出每一个view的特征的潜在均值和方差
         mu_s_list, sca_s_list, fea_p_list, fea_list = self.inference_z(x_list)
+
         z_mu = torch.stack(mu_s_list,dim=0) # [v n d]
         z_sca = torch.stack(sca_s_list,dim=0) # [v n d]
         if torch.sum(torch.isnan(z_mu)).item() > 0:
@@ -327,4 +327,4 @@ class VAE(nn.Module):
         # cos_loss = compute_cosine_similarity(z_sample, z_sample_list_p)
         cos_loss = compute_cosine_similarity_list(z_sample_list_s, fea_p_list)
 
-        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, cos_loss, fea_p_list, fea_list
+        return z_sample, mu_s_list, sca_s_list, fusion_mu, fusion_sca, xr_list, xr_p_list, cos_loss, fea_p_list, fea_list, z_mu, z_sca
